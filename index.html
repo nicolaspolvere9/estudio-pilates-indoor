@@ -307,14 +307,29 @@ const TABLAS_ARRAY={
 
 /* Sincroniza un array completo del estado contra su tabla: inserta/actualiza
    lo que está en el array (upsert por id) y borra en la base lo que
-   nosotros mismos habíamos cargado antes y ya no está. */
-let _idsConocidos={};
+   nosotros mismos habíamos cargado antes y ya no está.
+   Importante: sólo se manda al servidor lo que es NUEVO o CAMBIÓ desde el
+   último guardado exitoso (comparando contra _snapConocidos). Antes se
+   reenviaba el array completo en cada guardado: como el upsert resuelve
+   por "insertar o actualizar", eso equivalía a intentar ACTUALIZAR también
+   las filas viejas que ni se habían tocado. En una tabla como 'cargos',
+   donde crear una fila nueva y modificar una existente requieren permisos
+   distintos, eso hacía que una empleada sin permiso para editar pagos no
+   pudiera ni generar un cargo nuevo: el intento de "actualizar" (sin cambios
+   reales) los cargos viejos ya cargados era rechazado por los permisos de la
+   base, y esa única fila rechazada hacía fallar todo el guardado. */
+let _idsConocidos={}, _snapConocidos={};
+function snapshotDe(filas,aDb){
+  const o={}; filas.forEach(f=>{ o[f.id]=JSON.stringify({id:f.id,...aDb(f)}); }); return o;
+}
 async function sincronizarTabla(tabla,filas,aDb,onConflict){
   const idsActuales=new Set(filas.map(f=>f.id));
   const idsPrevios=_idsConocidos[tabla]||new Set();
   const aBorrar=[...idsPrevios].filter(id=>!idsActuales.has(id));
-  if(filas.length){
-    const rows=filas.map(f=>({id:f.id,...aDb(f)}));
+  const snapPrev=_snapConocidos[tabla]||{};
+  const snapNuevo=snapshotDe(filas,aDb);
+  const rows=filas.map(f=>({id:f.id,...aDb(f)})).filter(f=>snapPrev[f.id]!==snapNuevo[f.id]);
+  if(rows.length){
     const {error}=await sb.from(tabla).upsert(rows,onConflict?{onConflict}:undefined);
     if(error) throw error;
   }
@@ -323,6 +338,7 @@ async function sincronizarTabla(tabla,filas,aDb,onConflict){
     if(error) throw error;
   }
   _idsConocidos[tabla]=idsActuales;
+  _snapConocidos[tabla]=snapNuevo;
 }
 /* Cierra la versión de turnos vigente y abre una nueva a partir de `desde`.
    Las semanas anteriores conservan los horarios que regían entonces. */
@@ -428,6 +444,8 @@ async function cargarSesionYDatos(){
     cargos:new Set(state.cargos.map(a=>a.id)), pagos:new Set(state.pagos.map(a=>a.id)),
     gastos:new Set(state.gastos.map(a=>a.id))
   };
+  _snapConocidos={};
+  Object.keys(TABLAS_ARRAY).forEach(k=>{ _snapConocidos[k]=snapshotDe(state[k],TABLAS_ARRAY[k].aDb); });
 }
 async function loadAll(){
   const {data:{session}}=await sb.auth.getSession();
@@ -829,7 +847,9 @@ function flotantesUbicados(alId,disc,fecha){
 }
 // Alumnos con crédito flotante sin ubicar en la semana de `fecha`
 function pendientesFlotantes(disc,fecha){
-  return state.alumnos.map(a=>{
+  // Sólo alumnas activas: si se da de baja a alguien con un turno flotante
+  // pendiente, no tiene sentido seguir pidiendo que se le ubique esa semana.
+  return state.alumnos.filter(a=>a.activo).map(a=>{
     const tiene=flotantesDe(a,disc,fecha), puestos=flotantesUbicados(a.id,disc,fecha);
     return {al:a, faltan:tiene-puestos};
   }).filter(x=>x.faltan>0);
@@ -910,7 +930,7 @@ function generarCargosPendientes(){
   let cambio=false;
   state.alumnos.filter(a=>a.activo&&(a.inscripciones||[]).length&&a.cicloDesde).forEach(al=>{
     let desde=al.cicloDesde;
-    for(let g=0;g<60;g++){
+    for(let g=0;g<500;g++){
       if(diff(desde,todayStr())<0) break;
       let c=state.cargos.find(x=>x.alumnoId===al.id&&x.desde===desde&&x.tipo!=='suelta');
       if(!c){ const pr=precioDe(al), hasta=finDeCiclo(desde,al);
@@ -1177,7 +1197,7 @@ async function entrar(){
     err.textContent='Email o contraseña incorrectos.';
     return;
   }
-  try{ await sb.rpc('registrar_intento_exitoso',{p_email:mail}); }catch(e){}
+  try{ await sb.rpc('registrar_intento_exitoso'); }catch(e){}
   if(!(await resolverMFA())) return; // quedó mostrando la pantalla del código de verificación
   await cargarSesionYDatos();
   if(!sesion){ err.textContent='Tu usuario está desactivado. Hablá con la dueña.'; return; }
@@ -1418,15 +1438,24 @@ function pintarDestinos(){
     }).join('');
 }
 function confirmarMover(horaDestino){
-  const m=window._mov;
-  const yo=usuarioActual();
-  state.cambios.push({id:uid(),alumnoId:m.alId,disciplina:agDisc,
-    fechaOrigen:m.fechaOrigen,horaOrigen:m.hora,
-    fechaDestino:m.fechaDestino,horaDestino:horaDestino,
-    creadoPor:yo?yo.nombre:''});
-  save('cambios'); cerrar();
-  agFecha=m.fechaDestino; agAbierto=horaDestino;
-  pintarVista(); showToast('Movida por esta vez.');
+  if(bloqueado('confirmar-mover')) return;
+  try{
+    const m=window._mov;
+    const yo=usuarioActual();
+    // Un mismo turno (alumno+disciplina+fecha/hora de origen) sólo puede tener
+    // un cambio vigente: si ya existe (por ej. por un doble toque), se actualiza
+    // en vez de crear una fila nueva con el mismo dato de negocio (rompería el
+    // guardado, ver onConflict de 'cambios').
+    const i=state.cambios.findIndex(x=>x.alumnoId===m.alId&&x.disciplina===agDisc&&x.fechaOrigen===m.fechaOrigen&&x.horaOrigen===m.hora);
+    const fila={id:i>=0?state.cambios[i].id:uid(),alumnoId:m.alId,disciplina:agDisc,
+      fechaOrigen:m.fechaOrigen,horaOrigen:m.hora,
+      fechaDestino:m.fechaDestino,horaDestino:horaDestino,
+      creadoPor:yo?yo.nombre:''};
+    if(i>=0) state.cambios[i]=fila; else state.cambios.push(fila);
+    save('cambios'); cerrar();
+    agFecha=m.fechaDestino; agAbierto=horaDestino;
+    pintarVista(); showToast('Movida por esta vez.');
+  } finally { desbloquear('confirmar-mover'); }
 }
 function deshacerCambio(id){
   state.cambios=state.cambios.filter(x=>x.id!==id);
@@ -1475,8 +1504,15 @@ function modalAgregar(hora){
   </div></div>`;
 }
 function ubicarFlotante(alId,hora){
-  state.flotantes.push({id:uid(),alumnoId:alId,disciplina:agDisc,fecha:agFecha,horario:hora});
-  save('flotantes'); cerrar(); pintarVista(); showToast('Turno flotante ubicado.');
+  if(bloqueado('ubicar-flotante')) return;
+  try{
+    // Evita duplicar la fila si el botón se toca dos veces (no hay restricción
+    // de unicidad en la base para esta tabla, así que un duplicado no fallaría
+    // con error: quedaría contando de más en el cupo, en silencio).
+    const ya=state.flotantes.some(f=>f.alumnoId===alId&&f.disciplina===agDisc&&f.fecha===agFecha&&f.horario===hora);
+    if(!ya) state.flotantes.push({id:uid(),alumnoId:alId,disciplina:agDisc,fecha:agFecha,horario:hora});
+    save('flotantes'); cerrar(); pintarVista(); showToast('Turno flotante ubicado.');
+  } finally { desbloquear('ubicar-flotante'); }
 }
 // Cargo puntual por una clase suelta, exigible el mismo día
 function cargoSuelta(alId){
@@ -1731,7 +1767,11 @@ async function guardarAlumno(){
       if(s.tipo==='flotante') continue;
       const cupo=state.config.cupos[i.disciplina];
       const fRef=addDays(lunes,DIAS.indexOf(s.dia));
-      const oc=ocupantes(i.disciplina,fRef,s.horario).filter(o=>o.tipo==='fijo'&&o.al.id!==id);
+      // Cuenta TODOS los ocupantes de ese horario (fijos, flotantes, únicos y
+      // movidos), igual que en la agenda: contar sólo los fijos permitía
+      // asignar un turno "libre" que en realidad ya estaba lleno con
+      // flotantes/únicos ubicados esa semana.
+      const oc=ocupantes(i.disciplina,fRef,s.horario).filter(o=>o.al.id!==id);
       if(oc.length>=cupo) return errorForm(`${i.disciplina==='pilates'?'Pilates':'Indoor'} ${s.dia} ${s.horario} ya está completo (${cupo}/${cupo}). Elegí otro horario.`);
     }
     const consentFirmado=document.getElementById('f_consent').checked;
@@ -1987,11 +2027,15 @@ function confirmarAnular(id){
   </div></div>`;
 }
 function anularPago(id){
-  const p=state.pagos.find(x=>x.id===id);
-  const c=state.cargos.find(x=>x.id===p.cargoId);
-  if(c){ c.pagado=false; delete c.fechaPago; delete c.recargoPagado; }
-  state.pagos=state.pagos.filter(x=>x.id!==id);
-  save('pagos'); save('cargos'); cerrar(); pintarVista(); showToast('Pago anulado.');
+  if(bloqueado('anular-pago-'+id)) return;
+  try{
+    const p=state.pagos.find(x=>x.id===id);
+    if(!p) return; // ya se anuló (por ej. doble toque en "Sí, anular")
+    const c=state.cargos.find(x=>x.id===p.cargoId);
+    if(c){ c.pagado=false; delete c.fechaPago; delete c.recargoPagado; }
+    state.pagos=state.pagos.filter(x=>x.id!==id);
+    save('pagos'); save('cargos'); cerrar(); pintarVista(); showToast('Pago anulado.');
+  } finally { desbloquear('anular-pago-'+id); }
 }
 
 /* ═════════ FINANZAS ═════════ */
@@ -2364,8 +2408,10 @@ function guardarConfig(){
   c.momentoCobro=document.getElementById('cf_momento').value;
   c.recargos.sort((a,b)=>Number(a.desde)-Number(b.desde));
   if(momentoPrev!==c.momentoCobro){
-    // cambió la política: se recalcula el vencimiento de los ciclos aún impagos
-    state.cargos.filter(x=>!x.pagado).forEach(x=>{
+    // cambió la política: se recalcula el vencimiento de los ciclos aún impagos.
+    // Las clases sueltas quedan afuera: son exigibles el mismo día siempre,
+    // sin importar el momento de cobro configurado para los ciclos.
+    state.cargos.filter(x=>!x.pagado&&x.tipo!=='suelta').forEach(x=>{
       const al=state.alumnos.find(a=>a.id===x.alumnoId);
       if(al) x.vence=vencimientoDeCiclo(x.desde,x.hasta,al);
     });
