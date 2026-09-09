@@ -291,8 +291,17 @@ function gastoADb(g){ return {categoria:g.categoria,disciplina:g.disciplina||'co
 
 const TABLAS_ARRAY={
   alumnos:{tabla:'alumnos',aDb:alumnoADb}, unicos:{tabla:'unicos',aDb:unicoADb},
-  flotantes:{tabla:'flotantes',aDb:flotanteADb}, cambios:{tabla:'cambios',aDb:cambioADb},
-  asistencias:{tabla:'asistencias',aDb:asistenciaADb},
+  flotantes:{tabla:'flotantes',aDb:flotanteADb},
+  // Estas dos tablas tienen además una restricción de unicidad "de negocio"
+  // (una sola fila por alumno+disciplina+turno), separada del id. Si dos
+  // dispositivos marcan la misma clase casi al mismo tiempo con una copia
+  // local desactualizada, cada uno puede generar un id nuevo para esa misma
+  // fila: sin decirle a Postgres contra qué columnas resolver el conflicto,
+  // eso choca con esa restricción y la escritura queda rechazada (error 409).
+  // Indicando el "onConflict" correcto, en vez de fallar actualiza la fila
+  // que ya existe.
+  cambios:{tabla:'cambios',aDb:cambioADb,onConflict:'alumno_id,disciplina,fecha_origen,hora_origen'},
+  asistencias:{tabla:'asistencias',aDb:asistenciaADb,onConflict:'alumno_id,disciplina,fecha,horario'},
   cargos:{tabla:'cargos',aDb:cargoADb}, pagos:{tabla:'pagos',aDb:pagoADb}, gastos:{tabla:'gastos',aDb:gastoADb}
 };
 
@@ -300,13 +309,13 @@ const TABLAS_ARRAY={
    lo que está en el array (upsert por id) y borra en la base lo que
    nosotros mismos habíamos cargado antes y ya no está. */
 let _idsConocidos={};
-async function sincronizarTabla(tabla,filas,aDb){
+async function sincronizarTabla(tabla,filas,aDb,onConflict){
   const idsActuales=new Set(filas.map(f=>f.id));
   const idsPrevios=_idsConocidos[tabla]||new Set();
   const aBorrar=[...idsPrevios].filter(id=>!idsActuales.has(id));
   if(filas.length){
     const rows=filas.map(f=>({id:f.id,...aDb(f)}));
-    const {error}=await sb.from(tabla).upsert(rows);
+    const {error}=await sb.from(tabla).upsert(rows,onConflict?{onConflict}:undefined);
     if(error) throw error;
   }
   if(aBorrar.length){
@@ -445,7 +454,7 @@ async function escribirClave(k,intento){
   try{
     if(k==='config') await escribirConfig();
     else if(k==='usuarios'){ /* los cambios de usuarios se escriben directo, no por acá */ }
-    else if(TABLAS_ARRAY[k]) await sincronizarTabla(TABLAS_ARRAY[k].tabla,state[k],TABLAS_ARRAY[k].aDb);
+    else if(TABLAS_ARRAY[k]) await sincronizarTabla(TABLAS_ARRAY[k].tabla,state[k],TABLAS_ARRAY[k].aDb,TABLAS_ARRAY[k].onConflict);
     return true;
   }catch(e){
     ultimoErrorStorage=(e&&e.message)?e.message:String(e);
@@ -546,7 +555,7 @@ async function activarMFA(){
     <div class="note" style="margin-bottom:12px;">Escaneá este código QR con una app de autenticación
       (Google Authenticator, Authy, Microsoft Authenticator...) o ingresá la clave manualmente.
       Después escribí acá el código de 6 dígitos que te muestre la app.</div>
-    <div style="text-align:center;margin:14px 0;">${data.totp.qr_code}</div>
+    <div style="text-align:center;margin:14px 0;"><img src="${esc(data.totp.qr_code)}" alt="Código QR" style="max-width:220px;width:100%;height:auto;"></div>
     <div class="note mono" style="text-align:center;word-break:break-all;">${esc(data.totp.secret)}</div>
     <label>Código de la app</label><input id="mfa_setup_code" inputmode="numeric" maxlength="6"
       onkeydown="if(event.key==='Enter')confirmarActivarMFA()">
