@@ -932,7 +932,12 @@ function generarCargosPendientes(){
     let desde=al.cicloDesde;
     for(let g=0;g<500;g++){
       if(diff(desde,todayStr())<0) break;
-      let c=state.cargos.find(x=>x.alumnoId===al.id&&x.desde===desde&&x.tipo!=='suelta');
+      // Además del match exacto por fecha, se busca cualquier ciclo ya
+      // existente que CUBRA esta fecha (desde<=desde<=hasta). Esto evita
+      // crear un ciclo duplicado/superpuesto si el "ciclo desde" del alumno
+      // se corrigió unos días y quedó desalineado con un cargo que ya existía.
+      let c=state.cargos.find(x=>x.alumnoId===al.id&&x.tipo!=='suelta'&&x.desde<=desde&&x.hasta>=desde)
+        ||state.cargos.find(x=>x.alumnoId===al.id&&x.desde===desde&&x.tipo!=='suelta');
       if(!c){ const pr=precioDe(al), hasta=finDeCiclo(desde,al);
         c={id:uid(),alumnoId:al.id,tipo:'ciclo',desde,hasta,vence:vencimientoDeCiclo(desde,hasta,al),
            monto:pr.monto,detalle:pr.detalle,reparto:repartoDe(al),pagado:false,venceV2:true};
