@@ -548,6 +548,9 @@ function puede(k){
   if(u.rol==='dueño') return true;
   return !!(u.permisos||{})[k];
 }
+// A diferencia de puede(), esto NO se puede otorgar por permisos: es exclusivo
+// del rol dueño, para acciones irreversibles como eliminar un alumno.
+function esDueño(){ const u=usuarioActual(); return !!u&&u.rol==='dueño'; }
 async function cerrarSesion(){
   await sb.auth.signOut();
   sesion=null; miMfaFactor=null;
@@ -1900,8 +1903,57 @@ function modalFicha(id){
       ?`<button class="btn block" onclick="cerrar();modalAlumno('${id}')">Editar alumno</button>
         <button class="btn ghost block" style="margin-top:9px;" onclick="cerrar();darBaja('${id}')">Dar de baja</button>`
       :`<button class="btn block" onclick="reactivar('${id}')">Reactivar alumno</button>`):''}
+    ${esDueño()?`<button class="btn danger block" style="margin-top:9px;" onclick="cerrar();eliminarAlumno('${id}')">Eliminar alumno definitivamente</button>`:''}
     <button class="btn ghost block" style="margin-top:9px;" onclick="cerrar()">Cerrar</button>
   </div></div>`;
+}
+// Borrado DEFINITIVO: a diferencia de "Dar de baja", esto no deja rastro.
+// Se borra la ficha y, en cascada en la base, sus inscripciones, asistencias,
+// cambios, turnos flotantes, pagos y cargos. Sólo lo puede hacer la dueña
+// (verificado también en el servidor, en la función eliminar_alumno).
+function eliminarAlumno(id){
+  if(!esDueño()) return;
+  const a=state.alumnos.find(x=>x.id===id);
+  if(!a) return;
+  const nombreEsperado=a.nombre.trim().toLowerCase();
+  document.getElementById('modalRoot').innerHTML=`
+  <div class="modal-overlay" onclick="if(event.target===this)cerrar()"><div class="modal">
+    <h2 style="margin-bottom:10px;">Eliminar a ${esc(a.nombre)}</h2>
+    <div class="note" style="color:var(--danger);"><b>Esta acción no se puede deshacer.</b> Se borran para
+      siempre la ficha, los turnos, las asistencias, los cambios, los turnos flotantes y <b>todos los pagos
+      y cargos</b> de ${esc(a.nombre)}. Si en cambio querés conservar su historial, usá "Dar de baja".</div>
+    <label style="margin-top:14px;">Para confirmar, escribí el nombre completo</label>
+    <input id="del_confirm" placeholder="${esc(a.nombre)}" autocomplete="off"
+      oninput="document.getElementById('del_btn').disabled=(this.value.trim().toLowerCase()!==${JSON.stringify(nombreEsperado)})">
+    <button id="del_btn" class="btn danger block" style="margin-top:16px;" disabled onclick="confirmarEliminarAlumno('${id}')">Eliminar definitivamente</button>
+    <button class="btn ghost block" style="margin-top:9px;" onclick="cerrar()">Cancelar</button>
+  </div></div>`;
+}
+async function confirmarEliminarAlumno(id){
+  if(!esDueño()) return;
+  if(bloqueado('eliminar-alumno')) return;
+  try{
+    const a=state.alumnos.find(x=>x.id===id);
+    if(!a) return;
+    const {error}=await sb.rpc('eliminar_alumno',{p_alumno_id:id});
+    if(error) return showToast('No se pudo eliminar: '+error.message);
+    // Se limpia el estado local (y lo que sincronizarTabla recuerda de cada
+    // tabla) para que el borrado, ya hecho en la base, no intente "recrearse"
+    // en el próximo guardado.
+    ['unicos','flotantes','cambios','asistencias','cargos','pagos'].forEach(k=>{
+      const idsBorrados=state[k].filter(x=>x.alumnoId===id).map(x=>x.id);
+      state[k]=state[k].filter(x=>x.alumnoId!==id);
+      idsBorrados.forEach(rowId=>{
+        if(_idsConocidos[k]) _idsConocidos[k].delete(rowId);
+        if(_snapConocidos[k]) delete _snapConocidos[k][rowId];
+      });
+    });
+    state.alumnos=state.alumnos.filter(x=>x.id!==id);
+    if(_idsConocidos.alumnos) _idsConocidos.alumnos.delete(id);
+    if(_snapConocidos.alumnos) delete _snapConocidos.alumnos[id];
+    cerrar(); pintarVista();
+    showToast(`${a.nombre} fue eliminado definitivamente.`);
+  } finally { desbloquear('eliminar-alumno'); }
 }
 
 /* ═════════ PAGOS ═════════ */
