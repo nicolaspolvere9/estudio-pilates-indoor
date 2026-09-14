@@ -1771,16 +1771,22 @@ async function guardarAlumno(){
     }
     const elVig=document.getElementById('f_vigDesde');
     const lunes=lunesDe(diaHabil((elVig&&elVig.value)||todayStr()));
+    const avisos=[];
     for(const i of window._ins) for(const s of i.slots){
       if(s.tipo==='flotante') continue;
       const cupo=state.config.cupos[i.disciplina];
       const fRef=addDays(lunes,DIAS.indexOf(s.dia));
-      // Cuenta TODOS los ocupantes de ese horario (fijos, flotantes, únicos y
-      // movidos), igual que en la agenda: contar sólo los fijos permitía
-      // asignar un turno "libre" que en realidad ya estaba lleno con
-      // flotantes/únicos ubicados esa semana.
       const oc=ocupantes(i.disciplina,fRef,s.horario).filter(o=>o.al.id!==id);
-      if(oc.length>=cupo) return errorForm(`${i.disciplina==='pilates'?'Pilates':'Indoor'} ${s.dia} ${s.horario} ya está completo (${cupo}/${cupo}). Elegí otro horario.`);
+      // Un turno fijo se ocupa TODAS las semanas, así que lo único que lo puede
+      // llenar de verdad son los otros turnos fijos (incluidas las que ese día
+      // están movidas a otro horario: el lugar lo siguen teniendo). Las que
+      // están por única vez —movidas desde otro turno, flotantes ubicados,
+      // clases sueltas— ocupan sólo esa fecha, así que no pueden impedir una
+      // asignación permanente: se avisa, pero no se bloquea.
+      const fijos=oc.filter(o=>o.tipo==='fijo'||o.tipo==='movido-origen');
+      const disc=i.disciplina==='pilates'?'Pilates':'Indoor';
+      if(fijos.length>=cupo) return errorForm(`${disc} ${s.dia} ${s.horario} ya está completo (${cupo}/${cupo}). Elegí otro horario.`);
+      if(oc.length>=cupo) avisos.push(`${s.dia} ${s.horario}: esa fecha hay ${oc.length-fijos.length} por única vez, quedan ${oc.length+1} en la clase`);
     }
     const consentFirmado=document.getElementById('f_consent').checked;
     const data={nombre:nom,dni:document.getElementById('f_dni').value.trim(),
@@ -1817,7 +1823,7 @@ async function guardarAlumno(){
     // Se limpian los filtros para que el alumno recién guardado sea visible
     busqueda=''; verInactivos=false;
     cerrar(); pintarVista();
-    showToast(`${nom} guardado.`);
+    showToast(avisos.length?`${nom} guardado. Ojo — ${avisos[0]}.`:`${nom} guardado.`);
   } finally { desbloquear('alumno'); }
 }
 function darBaja(id){
@@ -1886,7 +1892,8 @@ function modalFicha(id){
           ${curso?`En curso · paga el ${fmt(c.vence)}`:(r?`Venció el ${fmt(c.vence)} · ${d} días · recargo ${money(r)}`:`Venció el ${fmt(c.vence)} · ${d} días`)}</span></div>
           <div class="mono" style="font-weight:700;flex:0 0 auto;">${money(c.monto+r)}</div></div>`;}).join('')
         :'<div class="note">Sin ciclos pendientes.</div>'}
-      ${imp.length&&puede('pagos_editar')?`<button class="btn block sm" style="margin-top:11px;" onclick="cerrar();modalPago('${id}')">Registrar pago</button>`:''}
+      ${imp.length&&puede('pagos_editar')?`<button class="btn block sm" style="margin-top:11px;" onclick="cerrar();modalPago('${id}')">Registrar pago</button>
+        <button class="btn ghost block sm" style="margin-top:9px;" onclick="cerrar();modalFechaPago('${imp[0].id}')">Cambiar fecha de pago</button>`:''}
       ${pagosAl.length?`<div style="font-size:12px;color:var(--ink-faint);margin:12px 0 4px;font-weight:600;">PAGOS ANTERIORES</div>
         ${pagosAl.slice(0,8).map(p=>`<div class="hist-row"><span>${fmt(p.fecha)}</span>
           <span class="mono" style="font-weight:600;">${money(p.monto)}</span></div>`).join('')}`:''}
@@ -1915,16 +1922,18 @@ function eliminarAlumno(id){
   if(!esDueño()) return;
   const a=state.alumnos.find(x=>x.id===id);
   if(!a) return;
-  const nombreEsperado=a.nombre.trim().toLowerCase();
+  // Antes pedía escribir el nombre completo, pero eso queda trabado (sin avisar
+  // por qué) apenas hay una tilde, mayúscula o espacio de diferencia con lo que
+  // está guardado. Pedir una palabra fija es igual de deliberado y no falla así.
   document.getElementById('modalRoot').innerHTML=`
   <div class="modal-overlay" onclick="if(event.target===this)cerrar()"><div class="modal">
     <h2 style="margin-bottom:10px;">Eliminar a ${esc(a.nombre)}</h2>
     <div class="note" style="color:var(--danger);"><b>Esta acción no se puede deshacer.</b> Se borran para
       siempre la ficha, los turnos, las asistencias, los cambios, los turnos flotantes y <b>todos los pagos
       y cargos</b> de ${esc(a.nombre)}. Si en cambio querés conservar su historial, usá "Dar de baja".</div>
-    <label style="margin-top:14px;">Para confirmar, escribí el nombre completo</label>
-    <input id="del_confirm" placeholder="${esc(a.nombre)}" autocomplete="off"
-      oninput="document.getElementById('del_btn').disabled=(this.value.trim().toLowerCase()!==${JSON.stringify(nombreEsperado)})">
+    <label style="margin-top:14px;">Para confirmar, escribí ELIMINAR</label>
+    <input id="del_confirm" placeholder="ELIMINAR" autocomplete="off"
+      oninput="document.getElementById('del_btn').disabled=(this.value.trim().toUpperCase()!=='ELIMINAR')">
     <button id="del_btn" class="btn danger block" style="margin-top:16px;" disabled onclick="confirmarEliminarAlumno('${id}')">Eliminar definitivamente</button>
     <button class="btn ghost block" style="margin-top:9px;" onclick="cerrar()">Cancelar</button>
   </div></div>`;
@@ -2047,6 +2056,44 @@ function confirmarPago(cargoId){
       registradoPor:usuarioActual().nombre});
     save('cargos'); save('pagos'); cerrar(); pintarVista(); showToast('Pago registrado.');
   } finally { desbloquear('pago'); }
+}
+/* Corrige a mano cuándo tiene que pagar un ciclo pendiente. Hace falta porque
+   el vencimiento se calcula contando las clases del ciclo desde que la alumna
+   arrancó, y eso se desalinea de la realidad cuando paga antes o después de lo
+   previsto: ahí el que sabe la fecha correcta es el estudio, no la cuenta.
+   El ciclo se cierra el día anterior a la nueva fecha, así el siguiente arranca
+   justo ese día y todos los vencimientos que siguen se acomodan solos. */
+function modalFechaPago(cargoId){
+  if(!puede('pagos_editar')) return;
+  const c=state.cargos.find(x=>x.id===cargoId);
+  if(!c) return;
+  const a=state.alumnos.find(x=>x.id===c.alumnoId);
+  document.getElementById('modalRoot').innerHTML=`
+  <div class="modal-overlay" onclick="if(event.target===this)cerrar()"><div class="modal">
+    <h2 style="margin-bottom:6px;">Fecha de pago de ${a?esc(a.nombre):'—'}</h2>
+    <div class="note" style="margin-bottom:12px;">Ciclo del ${fmt(c.desde)} al ${fmt(c.hasta)}.
+      Ahora figura que paga el <b>${fmt(c.vence)}</b>. Si ponés otra fecha, el ciclo se cierra el día
+      anterior y el ciclo siguiente arranca ese mismo día.</div>
+    <label style="margin-top:0;">¿Qué día tiene que pagar?</label>
+    <input type="date" id="fp_fecha" value="${c.vence}">
+    <button class="btn block" style="margin-top:16px;" onclick="guardarFechaPago('${cargoId}')">Guardar</button>
+    <button class="btn ghost block" style="margin-top:9px;" onclick="cerrar()">Cancelar</button>
+  </div></div>`;
+}
+function guardarFechaPago(cargoId){
+  if(!puede('pagos_editar')) return;
+  if(bloqueado('fecha-pago')) return;
+  try{
+    const c=state.cargos.find(x=>x.id===cargoId);
+    if(!c) return;
+    const f=document.getElementById('fp_fecha').value;
+    if(!f) return showToast('Elegí una fecha.');
+    if(diff(c.desde,f)<=0) return showToast('La fecha tiene que ser posterior al inicio del ciclo.');
+    c.vence=f; c.hasta=addDays(f,-1);
+    save('cargos');
+    generarCargosPendientes();
+    cerrar(); pintarVista(); showToast('Fecha de pago actualizada.');
+  } finally { desbloquear('fecha-pago'); }
 }
 function modalEditarPago(pagoId){
   if(!puede('pagos_editar')) return;
