@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
+<meta name="app-version" content="2026-09-14.3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -1893,7 +1894,7 @@ function modalFicha(id){
           <div class="mono" style="font-weight:700;flex:0 0 auto;">${money(c.monto+r)}</div></div>`;}).join('')
         :'<div class="note">Sin ciclos pendientes.</div>'}
       ${imp.length&&puede('pagos_editar')?`<button class="btn block sm" style="margin-top:11px;" onclick="cerrar();modalPago('${id}')">Registrar pago</button>
-        <button class="btn ghost block sm" style="margin-top:9px;" onclick="cerrar();modalFechaPago('${imp[0].id}')">Cambiar fecha de pago</button>`:''}
+        <button class="btn ghost block sm" style="margin-top:9px;" onclick="cerrar();modalFechaPago('${imp[0].id}')">Cambiar cuándo tiene que pagar</button>`:''}
       ${pagosAl.length?`<div style="font-size:12px;color:var(--ink-faint);margin:12px 0 4px;font-weight:600;">PAGOS ANTERIORES</div>
         ${pagosAl.slice(0,8).map(p=>`<div class="hist-row"><span>${fmt(p.fecha)}</span>
           <span class="mono" style="font-weight:600;">${money(p.monto)}</span></div>`).join('')}`:''}
@@ -2054,8 +2055,44 @@ function confirmarPago(cargoId){
     c.pagado=true; c.fechaPago=fecha; c.recargoPagado=r;
     state.pagos.push({id:uid(),alumnoId:c.alumnoId,cargoId,fecha,monto,recargo:r,nota,
       registradoPor:usuarioActual().nombre});
+    reanclarCiclo(c,fecha);
     save('cargos'); save('pagos'); cerrar(); pintarVista(); showToast('Pago registrado.');
   } finally { desbloquear('pago'); }
+}
+/* El ciclo se vuelve a contar cada vez que la alumna paga: el próximo
+   vencimiento cae cuando se le terminan las clases contadas desde el día que
+   pagó, y no sobre una grilla fija arrancada meses atrás. Si paga justo el día
+   que le vencía —lo normal— esto no cambia nada. Si paga antes o después, corre
+   el vencimiento siguiente para que siempre sean sus clases contadas desde el
+   pago. (El recargo por atraso no lo toca: ese se calcula aparte, sobre la
+   fecha en que le vencía.) */
+function reanclarCiclo(c,fecha){
+  if(c.tipo==='suelta') return;
+  const al=state.alumnos.find(a=>a.id===c.alumnoId);
+  if(!al) return;
+  // Si todavía arrastra un ciclo más viejo sin pagar, primero tiene que
+  // ponerse al día: recién ahí tiene sentido reacomodar el calendario.
+  if(state.cargos.some(x=>x.alumnoId===c.alumnoId&&x.id!==c.id&&!x.pagado&&
+     x.tipo!=='suelta'&&x.desde<c.desde)) return;
+
+  const conCicloEmpezado=diff(c.desde,fecha)>0;
+  // Pagó con el ciclo ya empezado: ese ciclo se cierra el día anterior y el
+  // nuevo arranca el día del pago. Pagó el ciclo entero por adelantado: ya
+  // estaba bien contado, y el siguiente vence cuando se le terminan las clases
+  // que acaba de pagar.
+  const arranca=conCicloEmpezado?fecha:addDays(c.hasta,1);
+  if(conCicloEmpezado) c.hasta=addDays(fecha,-1);
+  const hasta=finDeCiclo(arranca,al);
+  const vence=conCicloEmpezado?vencimientoDeCiclo(arranca,hasta,al):c.vence;
+
+  const sig=state.cargos.filter(x=>x.alumnoId===al.id&&!x.pagado&&x.tipo!=='suelta')
+    .sort((a,b)=>a.desde.localeCompare(b.desde))[0];
+  if(sig){ sig.desde=arranca; sig.hasta=hasta; sig.vence=vence; }
+  else{
+    const pr=precioDe(al);
+    state.cargos.push({id:uid(),alumnoId:al.id,tipo:'ciclo',desde:arranca,hasta,vence,
+      monto:pr.monto,detalle:pr.detalle,reparto:repartoDe(al),pagado:false,venceV2:true});
+  }
 }
 /* Corrige a mano cuándo tiene que pagar un ciclo pendiente. Hace falta porque
    el vencimiento se calcula contando las clases del ciclo desde que la alumna
@@ -2070,10 +2107,10 @@ function modalFechaPago(cargoId){
   const a=state.alumnos.find(x=>x.id===c.alumnoId);
   document.getElementById('modalRoot').innerHTML=`
   <div class="modal-overlay" onclick="if(event.target===this)cerrar()"><div class="modal">
-    <h2 style="margin-bottom:6px;">Fecha de pago de ${a?esc(a.nombre):'—'}</h2>
-    <div class="note" style="margin-bottom:12px;">Ciclo del ${fmt(c.desde)} al ${fmt(c.hasta)}.
-      Ahora figura que paga el <b>${fmt(c.vence)}</b>. Si ponés otra fecha, el ciclo se cierra el día
-      anterior y el ciclo siguiente arranca ese mismo día.</div>
+    <h2 style="margin-bottom:6px;">¿Cuándo tiene que pagar ${a?esc(a.nombre):'—'}?</h2>
+    <div class="note" style="margin-bottom:12px;">Esto <b>no registra un pago</b>: cambia la fecha en la
+      que le toca pagar el ciclo que tiene pendiente (del ${fmt(c.desde)} al ${fmt(c.hasta)}, hoy figura
+      el <b>${fmt(c.vence)}</b>). Si ya te pagó, cerrá esto y usá "Registrar pago".</div>
     <label style="margin-top:0;">¿Qué día tiene que pagar?</label>
     <input type="date" id="fp_fecha" value="${c.vence}">
     <button class="btn block" style="margin-top:16px;" onclick="guardarFechaPago('${cargoId}')">Guardar</button>
@@ -2088,7 +2125,7 @@ function guardarFechaPago(cargoId){
     if(!c) return;
     const f=document.getElementById('fp_fecha').value;
     if(!f) return showToast('Elegí una fecha.');
-    if(diff(c.desde,f)<=0) return showToast('La fecha tiene que ser posterior al inicio del ciclo.');
+    if(diff(c.desde,f)<=0) return showToast(`Ese ciclo arranca el ${fmt(c.desde)}, así que no puede vencer antes. Si lo que querés es anotar un pago que ya te hizo, usá "Registrar pago".`);
     c.vence=f; c.hasta=addDays(f,-1);
     save('cargos');
     generarCargosPendientes();
@@ -2397,7 +2434,8 @@ function vConfig(){
   const c=state.config;
   const dSin=diasSinBackup();
   const esDueno=(usuarioActual()||{}).rol==='dueño';
-  const h=`<div class="card"><h3>Copia de seguridad</h3>
+  const h=`<div class="note" style="margin-bottom:12px;">Versión de la app: <b>${esc(VERSION_APP||'—')}</b> · se actualiza sola al abrirla.</div>
+    <div class="card"><h3>Copia de seguridad</h3>
     <div class="note ${dSin===null||dSin>14?'aviso':''}" style="margin:8px 0 12px;">
       ${state.config.ultimoBackup
         ? `Última copia: <b>${fmt(state.config.ultimoBackup)}</b>${dSin>14?` — hace ${dSin} días. Conviene bajar una nueva.`:` (hace ${dSin} día${dSin===1?'':'s'})`}`
@@ -2530,6 +2568,40 @@ function guardarConfig(){
 sb.auth.onAuthStateChange((event)=>{
   if(event==='PASSWORD_RECOVERY'){ recuperando=true; render(); }
 });
+
+/* ═════════ ACTUALIZACIÓN AUTOMÁTICA ═════════
+   El teléfono guarda una copia de la app para que abra rápido, y esa copia
+   puede quedar vieja después de publicar una versión nueva. Acá se pide el
+   archivo al servidor salteando esa copia y, si la versión publicada es
+   distinta a la que está corriendo, se recarga sola. Si algo falla (sin
+   internet, por ejemplo), no pasa nada: sigue andando la versión actual. */
+const VERSION_APP=(document.querySelector('meta[name="app-version"]')||{}).content||'';
+let _ultimoChequeo=0;
+async function buscarActualizacion(){
+  try{
+    if(!VERSION_APP) return;
+    if(Date.now()-_ultimoChequeo<600000) return; // no más de una vez cada 10 min
+    _ultimoChequeo=Date.now();
+    // Si ya se recargó buscando esta misma versión, no se insiste (evita
+    // quedar recargando en loop si el servidor sigue entregando la vieja).
+    const yaIntentada=new URLSearchParams(location.search).get('v');
+    const r=await fetch(location.pathname+'?_ac='+Date.now(),{cache:'no-store'});
+    if(!r.ok) return;
+    const texto=await r.text();
+    const m=texto.match(/<meta name="app-version" content="([^"]+)"/);
+    if(!m) return;
+    const publicada=m[1];
+    if(publicada===VERSION_APP||publicada===yaIntentada) return;
+    // Nunca se recarga con algo abierto a medias: se perdería lo que se está
+    // cargando. Queda para la próxima vez que se abra la app.
+    const modal=document.getElementById('modalRoot');
+    if(modal&&modal.innerHTML.trim()) return;
+    location.replace(location.pathname+'?v='+encodeURIComponent(publicada));
+  }catch(e){ /* sin conexión o servidor caído: se sigue con la versión actual */ }
+}
+buscarActualizacion();
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden) buscarActualizacion(); });
+
 loadAll();
 </script>
 </body>
