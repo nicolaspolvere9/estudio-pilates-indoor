@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
-<meta name="app-version" content="2026-09-23.1">
+<meta name="app-version" content="2026-09-23.2">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -460,28 +460,25 @@ async function loadAll(){
 let _pend=new Set(), _timer=null, _resolvers=[], _flushing=false;
 let modoSoloMemoria=false, ultimoErrorStorage='', ultimoGuardadoOk=null;
 
-let _primerPend=0;
 function save(key){
   _pend.add(key);
   return new Promise(res=>{
     _resolvers.push(res);
-    if(!_primerPend) _primerPend=Date.now();
-    if(_timer) clearTimeout(_timer);
-    // El respiro de 450 ms junta varios toques seguidos en una sola escritura.
-    // Pero no puede postergarse eternamente: marcando presentes uno atrás del
-    // otro, cada toque reiniciaba la espera y no se guardaba nada hasta frenar.
-    // Pasado un segundo desde el primer cambio sin guardar, se escribe ya.
-    const espera=(Date.now()-_primerPend>1200)?0:450;
-    _timer=setTimeout(()=>{ _timer=null; _primerPend=0; flush(); },espera);
+    // Ventana FIJA de 450 ms desde el primer cambio sin guardar: los toques que
+    // caen dentro se juntan en una sola escritura, pero no la corren para
+    // adelante. Antes cada toque reiniciaba la espera, así que marcando rápido
+    // no se guardaba nada hasta frenar — y si la página se recargaba en el medio
+    // (por una actualización o porque el teléfono descartó la pestaña), esas
+    // marcas se perdían enteras.
+    if(!_timer) _timer=setTimeout(()=>{ _timer=null; flush(); },450);
   });
 }
-function hayPendientes(){ return _pend.size>0||_flushing||!!_timer; }
-/* Si la app pasa a segundo plano —cambia de app, bloquea el teléfono, cierra la
-   pestaña— se guarda en el acto lo que quedó pendiente. Si no, el respiro de
-   450 ms queda congelado por el sistema y esos cambios no llegan nunca. */
+function hayPendientes(){ return _pend.size>0||_flushing||!!_timer||modoSoloMemoria; }
+/* Guarda en el acto, sin esperar la ventana. Se usa cuando la app pasa a
+   segundo plano —cambia de app, bloquea el teléfono, cierra la pestaña— y al
+   marcar asistencias, que es lo que se carga de a muchas y seguidas. */
 function guardarYa(){
   if(_timer){ clearTimeout(_timer); _timer=null; }
-  _primerPend=0;
   if(_pend.size) flush();
 }
 document.addEventListener('visibilitychange',()=>{ if(document.hidden) guardarYa(); });
@@ -1427,7 +1424,10 @@ function marcar(id,hora,estado){
   const i=state.asistencias.findIndex(x=>x.alumnoId===id&&x.disciplina===agDisc&&x.fecha===agFecha&&x.horario===hora);
   if(i>=0){ if(state.asistencias[i].estado===estado) state.asistencias.splice(i,1); else state.asistencias[i].estado=estado; }
   else state.asistencias.push({id:uid(),alumnoId:id,disciplina:agDisc,fecha:agFecha,horario:hora,estado});
-  save('asistencias'); pintarVista();
+  // Las asistencias se escriben en el acto, sin esperar la ventana de 450 ms:
+  // se cargan de a muchas y seguidas, y cualquier recarga de la página en el
+  // medio se llevaba puesto lo que todavía no había salido.
+  save('asistencias'); guardarYa(); pintarVista();
 }
 function modalMover(alId,hora){
   const al=state.alumnos.find(a=>a.id===alId);
