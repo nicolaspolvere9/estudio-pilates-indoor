@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
-<meta name="app-version" content="2026-09-14.3">
+<meta name="app-version" content="2026-09-23.1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -460,14 +460,32 @@ async function loadAll(){
 let _pend=new Set(), _timer=null, _resolvers=[], _flushing=false;
 let modoSoloMemoria=false, ultimoErrorStorage='', ultimoGuardadoOk=null;
 
+let _primerPend=0;
 function save(key){
   _pend.add(key);
   return new Promise(res=>{
     _resolvers.push(res);
+    if(!_primerPend) _primerPend=Date.now();
     if(_timer) clearTimeout(_timer);
-    _timer=setTimeout(()=>{ _timer=null; flush(); },450);
+    // El respiro de 450 ms junta varios toques seguidos en una sola escritura.
+    // Pero no puede postergarse eternamente: marcando presentes uno atrás del
+    // otro, cada toque reiniciaba la espera y no se guardaba nada hasta frenar.
+    // Pasado un segundo desde el primer cambio sin guardar, se escribe ya.
+    const espera=(Date.now()-_primerPend>1200)?0:450;
+    _timer=setTimeout(()=>{ _timer=null; _primerPend=0; flush(); },espera);
   });
 }
+function hayPendientes(){ return _pend.size>0||_flushing||!!_timer; }
+/* Si la app pasa a segundo plano —cambia de app, bloquea el teléfono, cierra la
+   pestaña— se guarda en el acto lo que quedó pendiente. Si no, el respiro de
+   450 ms queda congelado por el sistema y esos cambios no llegan nunca. */
+function guardarYa(){
+  if(_timer){ clearTimeout(_timer); _timer=null; }
+  _primerPend=0;
+  if(_pend.size) flush();
+}
+document.addEventListener('visibilitychange',()=>{ if(document.hidden) guardarYa(); });
+window.addEventListener('pagehide',guardarYa);
 async function escribirClave(k,intento){
   intento=intento||0;
   try{
@@ -2592,10 +2610,12 @@ async function buscarActualizacion(){
     if(!m) return;
     const publicada=m[1];
     if(publicada===VERSION_APP||publicada===yaIntentada) return;
-    // Nunca se recarga con algo abierto a medias: se perdería lo que se está
-    // cargando. Queda para la próxima vez que se abra la app.
+    // Nunca se recarga con algo abierto a medias ni con cambios sin guardar:
+    // se perdería lo que se está cargando. Queda para la próxima vez que se
+    // abra la app.
     const modal=document.getElementById('modalRoot');
     if(modal&&modal.innerHTML.trim()) return;
+    if(hayPendientes()) return;
     location.replace(location.pathname+'?v='+encodeURIComponent(publicada));
   }catch(e){ /* sin conexión o servidor caído: se sigue con la versión actual */ }
 }
