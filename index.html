@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
-<meta name="app-version" content="2026-09-28.2">
+<meta name="app-version" content="2026-09-28.3">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -374,10 +374,13 @@ async function escribirConfig(){
 /* Supabase devuelve como máximo 1000 filas por consulta. Esta función pide
    la tabla de a bloques de 1000 hasta traerla completa (antes, pasadas las
    1000 asistencias, las más nuevas nunca volvían a cargarse). */
-async function traerTodo(tabla,cols){
+async function traerTodo(tabla,cols,filtro){
   const BLOQUE=1000;
-  const pagina=(d,conteo)=>sb.from(tabla).select(cols||'*',conteo?{count:'exact'}:undefined)
-    .order('id',{ascending:true}).range(d,d+BLOQUE-1);
+  const pagina=(d,conteo)=>{
+    let q=sb.from(tabla).select(cols||'*',conteo?{count:'exact'}:undefined);
+    if(filtro) q=filtro(q);
+    return q.order('id',{ascending:true}).range(d,d+BLOQUE-1);
+  };
   // 1ª página + total de filas; el resto de las páginas se piden todas juntas
   // (en paralelo) para que la carga siga siendo rápida aunque haya miles.
   const pri=await pagina(0,true);
@@ -402,8 +405,73 @@ async function traerTodo(tabla,cols){
   for(const p of partes) for(const f of p){ if(!vistos.has(f.id)){ vistos.add(f.id); todo.push(f); } }
   return {data:todo,error:null};
 }
+/* ── Asistencias: al abrir se cargan solo las recientes ──
+   Se traen las del mes actual y los 2 anteriores (ej.: en septiembre, desde
+   el 1/7). Las más viejas NO se borran: siguen guardadas en Supabase y se
+   traen solas cuando hace falta (agenda de una fecha vieja, "ver historial
+   completo" en la ficha, descargas y copias de seguridad). */
+let asisDesde='0000-01-01';
+function inicioVentanaAsis(){
+  const [y,m]=todayStr().split('-').map(Number);
+  const d=new Date(y,m-1-2,1);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01`;
+}
+function asisDeDb(r){ return {id:r.id,alumnoId:r.alumno_id,disciplina:r.disciplina,fecha:r.fecha,horario:r.horario,estado:r.estado}; }
+function claveAsis(x){ return x.alumnoId+'|'+x.disciplina+'|'+x.fecha+'|'+x.horario; }
+// Suma al estado asistencias traídas aparte, sin duplicar y marcándolas como
+// "ya guardadas" (así no se re-suben y, si se desmarcan, se borran bien).
+// Si justo se está guardando, espera a que termine (el guardado reescribe
+// la lista de filas conocidas y podría pisar las que se suman acá).
+async function esperarGuardado(){ for(let i=0;i<100&&_flushing;i++) await new Promise(r=>setTimeout(r,100)); }
+function sumarAsistencias(filas){
+  const claves=new Set(state.asistencias.map(claveAsis));
+  const ids=_idsConocidos.asistencias||(_idsConocidos.asistencias=new Set());
+  const snap=_snapConocidos.asistencias;
+  let n=0;
+  for(const r of filas){
+    const x=asisDeDb(r);
+    if(claves.has(claveAsis(x))) continue;
+    claves.add(claveAsis(x)); state.asistencias.push(x); ids.add(x.id); n++;
+    if(snap) Object.assign(snap,snapshotDe([x],asistenciaADb));
+  }
+  return n;
+}
+function inicioMes(f){ return f.slice(0,8)+'01'; }
+let _cargandoAsis=null;
+// Si la agenda va a una semana anterior a lo cargado, trae lo que falta.
+async function asegurarAsistenciasDesde(fecha){
+  const desde=inicioMes(addDays(fecha,-6));
+  if(desde>=asisDesde||!sesion) return false;
+  if(_cargandoAsis) await _cargandoAsis;
+  if(desde>=asisDesde) return false;
+  const hasta=asisDesde;
+  _cargandoAsis=traerTodo('asistencias','*',q=>q.gte('fecha',desde).lt('fecha',hasta));
+  try{
+    const r=await _cargandoAsis;
+    if(r.error){ showToast('No se pudieron traer las asistencias viejas.'); return false; }
+    await esperarGuardado(); sumarAsistencias(r.data); asisDesde=desde; return true;
+  } finally { _cargandoAsis=null; }
+}
+function revisarAsistenciasAgenda(){
+  if(agFecha<asisDesde) asegurarAsistenciasDesde(agFecha).then(ok=>{ if(ok) pintarVista(); });
+}
+// Para descargas/copias: todas las asistencias, incluidas las viejas.
+async function todasLasAsistencias(){
+  const r=await traerTodo('asistencias');
+  if(r.error) throw r.error;
+  const map=new Map(r.data.map(x=>{ const a=asisDeDb(x); return [claveAsis(a),a]; }));
+  state.asistencias.forEach(a=>map.set(claveAsis(a),a)); // lo local (quizás aún sin subir) manda
+  return [...map.values()];
+}
+const _historialCompleto=new Set();
+async function verHistorialCompleto(id){
+  const r=await traerTodo('asistencias','*',q=>q.eq('alumno_id',id).lt('fecha',asisDesde));
+  if(r.error) return showToast('No se pudo traer el historial.');
+  await esperarGuardado(); sumarAsistencias(r.data); _historialCompleto.add(id); modalFicha(id);
+}
 async function cargarSesionYDatos(){
   agFecha=diaHabil(todayStr()); // la agenda nunca arranca en domingo
+  asisDesde=inicioVentanaAsis(); _historialCompleto.clear();
   const {data:{user}}=await sb.auth.getUser();
   if(!user){ sesion=null; return; }
   const {data:perfil}=await sb.from('perfiles').select('*').eq('id',user.id).maybeSingle();
@@ -415,7 +483,7 @@ async function cargarSesionYDatos(){
   const [alRes,insRes,unRes,flRes,asRes,caRes,paRes,gaRes,cfRes,peRes,cbRes,acRes]=await Promise.all([
     traerTodo('alumnos'), traerTodo('inscripciones','*, slots(*)'),
     traerTodo('unicos'), traerTodo('flotantes'),
-    traerTodo('asistencias'), traerTodo('cargos'),
+    traerTodo('asistencias','*',q=>q.gte('fecha',asisDesde)), traerTodo('cargos'),
     traerTodo('pagos'), traerTodo('gastos'),
     sb.from('config').select('*').eq('id',true).maybeSingle(), traerTodo('perfiles'),
     traerTodo('cambios'),
@@ -454,7 +522,7 @@ async function cargarSesionYDatos(){
 
   state.unicos=(unRes.data||[]).map(r=>({id:r.id,alumnoId:r.alumno_id,disciplina:r.disciplina,fecha:r.fecha,horario:r.horario}));
   state.flotantes=(flRes.data||[]).map(r=>({id:r.id,alumnoId:r.alumno_id,disciplina:r.disciplina,fecha:r.fecha,horario:r.horario}));
-  state.asistencias=(asRes.data||[]).map(r=>({id:r.id,alumnoId:r.alumno_id,disciplina:r.disciplina,fecha:r.fecha,horario:r.horario,estado:r.estado}));
+  state.asistencias=(asRes.data||[]).map(asisDeDb);
   state.cargos=(caRes.data||[]).map(r=>({id:r.id,alumnoId:r.alumno_id,tipo:r.tipo,desde:r.desde,hasta:r.hasta,
     vence:r.vence,monto:Number(r.monto),detalle:r.detalle||'',
     reparto:{pilates:Number(r.reparto_pilates)||0,indoor:Number(r.reparto_indoor)||0},
@@ -717,19 +785,22 @@ function descargarArchivo(nombre,contenido,mime){
     return true;
   }catch(e){ console.error('descarga falló',e); return false; }
 }
-function armarBackup(){
+function armarBackup(asisTodas){
   return JSON.stringify({
     _app:'estudio-pilates-indoor',
     _version:BACKUP_VERSION,
     _fecha:new Date().toISOString(),
     alumnos:state.alumnos, unicos:state.unicos, flotantes:state.flotantes,
-    asistencias:state.asistencias, cargos:state.cargos, pagos:state.pagos,
+    asistencias:asisTodas||state.asistencias, cargos:state.cargos, pagos:state.pagos,
     gastos:state.gastos, usuarios:state.usuarios, config:state.config
   },null,2);
 }
 function nombreBackup(){ return `estudio-backup-${todayStr()}.json`; }
 async function exportarBackup(){
-  const txt=armarBackup();
+  let asisTodas;
+  try{ asisTodas=await todasLasAsistencias(); }
+  catch(e){ return showToast('No se pudo armar la copia (sin conexión). Probá de nuevo.'); }
+  const txt=armarBackup(asisTodas);
   const ok=descargarArchivo(nombreBackup(),txt,'application/json');
   state.config.ultimoBackup=todayStr();
   await save('config');
@@ -742,7 +813,7 @@ function csvEscape(v){
   return /[";\n]/.test(s) ? '"'+s.replace(/"/g,'""')+'"' : s;
 }
 function armarCSV(filas){ return filas.map(f=>f.map(csvEscape).join(';')).join('\n'); }
-function exportarCSV(tipo){
+async function exportarCSV(tipo){
   let filas=[], nombre='';
   if(tipo==='alumnos'){
     nombre=`alumnos-${todayStr()}.csv`;
@@ -767,7 +838,10 @@ function exportarCSV(tipo){
   } else if(tipo==='asistencias'){
     nombre=`asistencias-${todayStr()}.csv`;
     filas=[['Fecha','Alumno','Disciplina','Horario','Estado']];
-    [...state.asistencias].sort((a,b)=>a.fecha.localeCompare(b.fecha)).forEach(x=>{
+    let lista;
+    try{ lista=await todasLasAsistencias(); }
+    catch(e){ return showToast('No se pudieron traer las asistencias. Probá de nuevo.'); }
+    lista.sort((a,b)=>a.fecha.localeCompare(b.fecha)).forEach(x=>{
       const al=state.alumnos.find(y=>y.id===x.alumnoId);
       filas.push([x.fecha, al?al.nombre:'—', x.disciplina, x.horario, x.estado]);
     });
@@ -860,7 +934,12 @@ function analizarBackup(texto){
 async function confirmarRestauracion(){
   const d=window._backupPend;
   if(!d) return showToast('No hay copia cargada.');
-  if(hayDatos()) descargarArchivo(`estudio-antes-de-restaurar-${todayStr()}.json`,armarBackup(),'application/json');
+  if(hayDatos()){
+    let asisTodas;
+    try{ asisTodas=await todasLasAsistencias(); }
+    catch(e){ return showToast('Sin conexión: no se puede restaurar ahora.'); }
+    descargarArchivo(`estudio-antes-de-restaurar-${todayStr()}.json`,armarBackup(asisTodas),'application/json');
+  }
   // Los usuarios (cuentas de acceso) no se restauran desde la copia: son
   // cuentas reales de Supabase y no se pueden recrear desde un JSON.
   ['alumnos','unicos','flotantes','asistencias','cargos','pagos','gastos'].forEach(k=>{
@@ -1454,8 +1533,8 @@ function vAgenda(){
   return h;
 }
 function setDisc(d){ agDisc=d; agAbierto=null; pintarVista(); }
-function setFecha(f){ agFecha=diaHabil(f); agAbierto=null; pintarVista(); }
-function moverSemana(n){ agFecha=diaHabil(addDays(agFecha,n*7)); agAbierto=null; pintarVista(); }
+function setFecha(f){ agFecha=diaHabil(f); agAbierto=null; pintarVista(); revisarAsistenciasAgenda(); }
+function moverSemana(n){ agFecha=diaHabil(addDays(agFecha,n*7)); agAbierto=null; pintarVista(); revisarAsistenciasAgenda(); }
 function irHoy(){ agFecha=diaHabil(todayStr()); agAbierto=null; pintarVista(); }
 function toggleSlot(h){ agAbierto=agAbierto===h?null:h; pintarVista(); }
 function marcar(id,hora,estado){
@@ -1520,7 +1599,7 @@ function confirmarMover(horaDestino){
     if(i>=0) state.cambios[i]=fila; else state.cambios.push(fila);
     save('cambios'); cerrar();
     agFecha=m.fechaDestino; agAbierto=horaDestino;
-    pintarVista(); showToast('Movida por esta vez.');
+    pintarVista(); revisarAsistenciasAgenda(); showToast('Movida por esta vez.');
   } finally { desbloquear('confirmar-mover'); }
 }
 function deshacerCambio(id){
@@ -1957,7 +2036,9 @@ function modalFicha(id){
           <span class="mono" style="font-weight:600;">${money(p.monto)}</span></div>`).join('')}`:''}
     </div>`:''}
     <div class="card flat" style="padding:13px;"><h3>Asistencias</h3>
-      <div style="font-size:13px;color:var(--ink-soft);margin:6px 0 9px;">${vino} presentes · ${falto} faltas</div>
+      <div style="font-size:13px;color:var(--ink-soft);margin:6px 0 9px;">${vino} presentes · ${falto} faltas
+        ${_historialCompleto.has(id)?' · historial completo'
+          :` desde el ${fmt(asisDesde)} · <a href="#" onclick="event.preventDefault();verHistorialCompleto('${id}')">ver todo</a>`}</div>
       ${asis.slice(0,25).map(x=>`<div class="hist-row">
         <span>${fmt(x.fecha)} · ${x.horario} · ${x.disciplina==='pilates'?'Pilates':'Indoor'}</span>
         <span class="badge ${x.estado==='presente'?'ok':'deuda'}">${x.estado==='presente'?'Vino':'Faltó'}</span></div>`).join('')
