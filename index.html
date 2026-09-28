@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
-<meta name="app-version" content="2026-09-23.2">
+<meta name="app-version" content="2026-09-28.1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -370,6 +370,19 @@ async function escribirConfig(){
 /* Trae todos los datos del estudio desde Supabase y arma `state` con el
    mismo formato de siempre (incluyendo alumnos con sus inscripciones y
    turnos anidados, reconstruidos a partir de las tablas separadas). */
+/* Supabase devuelve como máximo 1000 filas por consulta. Esta función pide
+   la tabla de a bloques de 1000 hasta traerla completa (antes, pasadas las
+   1000 asistencias, las más nuevas nunca volvían a cargarse). */
+async function traerTodo(tabla,cols){
+  const BLOQUE=1000; let desde=0, todo=[];
+  for(;;){
+    const {data,error}=await sb.from(tabla).select(cols||'*').order('id',{ascending:true}).range(desde,desde+BLOQUE-1);
+    if(error) return {data:null,error};
+    todo=todo.concat(data||[]);
+    if(!data||data.length<BLOQUE) return {data:todo,error:null};
+    desde+=BLOQUE;
+  }
+}
 async function cargarSesionYDatos(){
   agFecha=diaHabil(todayStr()); // la agenda nunca arranca en domingo
   const {data:{user}}=await sb.auth.getUser();
@@ -381,12 +394,12 @@ async function cargarSesionYDatos(){
   await refrescarMiMFA();
 
   const [alRes,insRes,unRes,flRes,asRes,caRes,paRes,gaRes,cfRes,peRes,cbRes,acRes]=await Promise.all([
-    sb.from('alumnos').select('*'), sb.from('inscripciones').select('*, slots(*)'),
-    sb.from('unicos').select('*'), sb.from('flotantes').select('*'),
-    sb.from('asistencias').select('*'), sb.from('cargos').select('*'),
-    sb.from('pagos').select('*'), sb.from('gastos').select('*'),
-    sb.from('config').select('*').eq('id',true).maybeSingle(), sb.from('perfiles').select('*'),
-    sb.from('cambios').select('*'),
+    traerTodo('alumnos'), traerTodo('inscripciones','*, slots(*)'),
+    traerTodo('unicos'), traerTodo('flotantes'),
+    traerTodo('asistencias'), traerTodo('cargos'),
+    traerTodo('pagos'), traerTodo('gastos'),
+    sb.from('config').select('*').eq('id',true).maybeSingle(), traerTodo('perfiles'),
+    traerTodo('cambios'),
     // Si el usuario no tiene permiso para verlo, esto vuelve vacío (RLS): no rompe nada.
     sb.from('accesos_log').select('*').order('creado_at',{ascending:false}).limit(200)
   ]);
@@ -483,6 +496,13 @@ function guardarYa(){
 }
 document.addEventListener('visibilitychange',()=>{ if(document.hidden) guardarYa(); });
 window.addEventListener('pagehide',guardarYa);
+/* Orden en que se escriben las tablas: primero las "padre". Un cargo, una
+   asistencia o un turno no se pueden guardar si su alumno todavía no está en la
+   base, y un pago necesita que su cargo exista. Pasaba al anotar una clase
+   suelta con un alumno nuevo: el cargo salía antes que el alumno, la base lo
+   rechazaba, y esa clase quedaba sin cobrar. */
+const ORDEN_ESCRITURA=['config','alumnos','unicos','flotantes','cambios','asistencias','cargos','pagos','gastos','usuarios'];
+function rangoClave(k){ const i=ORDEN_ESCRITURA.indexOf(k); return i<0?99:i; }
 async function escribirClave(k,intento){
   intento=intento||0;
   try{
@@ -499,7 +519,7 @@ async function escribirClave(k,intento){
 async function flush(){
   if(_flushing) return;
   _flushing=true;
-  const keys=[..._pend]; _pend.clear();
+  const keys=[..._pend].sort((a,b)=>rangoClave(a)-rangoClave(b)); _pend.clear();
   let fallo=false;
   for(const k of keys){
     const ok=await escribirClave(k);
