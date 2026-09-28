@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
-<meta name="app-version" content="2026-09-28.1">
+<meta name="app-version" content="2026-09-28.2">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -334,8 +334,9 @@ async function sincronizarTabla(tabla,filas,aDb,onConflict){
     const {error}=await sb.from(tabla).upsert(rows,onConflict?{onConflict}:undefined);
     if(error) throw error;
   }
-  if(aBorrar.length){
-    const {error}=await sb.from(tabla).delete().in('id',aBorrar);
+  // Borrados de a 100: una lista enorme de ids no entra en una sola URL.
+  for(let i=0;i<aBorrar.length;i+=100){
+    const {error}=await sb.from(tabla).delete().in('id',aBorrar.slice(i,i+100));
     if(error) throw error;
   }
   _idsConocidos[tabla]=idsActuales;
@@ -374,14 +375,32 @@ async function escribirConfig(){
    la tabla de a bloques de 1000 hasta traerla completa (antes, pasadas las
    1000 asistencias, las más nuevas nunca volvían a cargarse). */
 async function traerTodo(tabla,cols){
-  const BLOQUE=1000; let desde=0, todo=[];
-  for(;;){
-    const {data,error}=await sb.from(tabla).select(cols||'*').order('id',{ascending:true}).range(desde,desde+BLOQUE-1);
-    if(error) return {data:null,error};
-    todo=todo.concat(data||[]);
-    if(!data||data.length<BLOQUE) return {data:todo,error:null};
-    desde+=BLOQUE;
+  const BLOQUE=1000;
+  const pagina=(d,conteo)=>sb.from(tabla).select(cols||'*',conteo?{count:'exact'}:undefined)
+    .order('id',{ascending:true}).range(d,d+BLOQUE-1);
+  // 1ª página + total de filas; el resto de las páginas se piden todas juntas
+  // (en paralelo) para que la carga siga siendo rápida aunque haya miles.
+  const pri=await pagina(0,true);
+  if(pri.error) return {data:null,error:pri.error};
+  let partes=[pri.data||[]];
+  let ultima=pri.data||[], desde=BLOQUE;
+  const total=typeof pri.count==='number'?pri.count:0;
+  if(ultima.length===BLOQUE&&total>BLOQUE){
+    const pedidos=[];
+    for(let d=BLOQUE; d<total; d+=BLOQUE) pedidos.push(pagina(d));
+    const res=await Promise.all(pedidos);
+    for(const r of res){ if(r.error) return {data:null,error:r.error}; partes.push(r.data||[]); ultima=r.data||[]; }
+    desde=BLOQUE*(pedidos.length+1);
   }
+  // Por si entraron filas nuevas mientras se cargaba: seguir hasta el final.
+  while(ultima.length===BLOQUE){
+    const r=await pagina(desde);
+    if(r.error) return {data:null,error:r.error};
+    ultima=r.data||[]; partes.push(ultima); desde+=BLOQUE;
+  }
+  const vistos=new Set(), todo=[];
+  for(const p of partes) for(const f of p){ if(!vistos.has(f.id)){ vistos.add(f.id); todo.push(f); } }
+  return {data:todo,error:null};
 }
 async function cargarSesionYDatos(){
   agFecha=diaHabil(todayStr()); // la agenda nunca arranca en domingo
