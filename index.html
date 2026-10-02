@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
-<meta name="app-version" content="2026-09-28.3">
+<meta name="app-version" content="2026-10-01.1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -1907,12 +1907,29 @@ async function guardarAlumno(){
       vistos.add(k);
     }
     const elVig=document.getElementById('f_vigDesde');
-    const lunes=lunesDe(diaHabil((elVig&&elVig.value)||todayStr()));
+    const desdeCupo=diaHabil((elVig&&elVig.value)||todayStr());
+    const lunes=lunesDe(desdeCupo);
     const avisos=[];
     for(const i of window._ins) for(const s of i.slots){
       if(s.tipo==='flotante') continue;
       const cupo=state.config.cupos[i.disciplina];
-      const fRef=addDays(lunes,DIAS.indexOf(s.dia));
+      const disc=i.disciplina==='pilates'?'Pilates':'Indoor';
+      // Primera clase real de ese turno: el primer <día> desde la fecha en que
+      // rige el cambio. (Antes se miraba ese día de la MISMA semana, aunque ya
+      // hubiera pasado: un jueves, revisaba el martes anterior y contaba a
+      // alumnas que justo ese martes habían dejado el horario.)
+      let f0=addDays(lunes,DIAS.indexOf(s.dia));
+      if(f0<desdeCupo) f0=addDays(f0,7);
+      // Un turno fijo es para todas las semanas: se revisan las próximas 8 por
+      // si alguien ya tiene programado entrar a ese horario más adelante.
+      let lleno=null;
+      for(let w=0;w<8&&!lleno;w++){
+        const f=addDays(f0,7*w);
+        const fx=ocupantes(i.disciplina,f,s.horario).filter(o=>o.al.id!==id&&(o.tipo==='fijo'||o.tipo==='movido-origen'));
+        if(fx.length>=cupo) lleno=f;
+      }
+      if(lleno) return errorForm(`${disc} ${s.dia} ${s.horario} está completo (${cupo}/${cupo})${lleno===f0?'':' a partir del '+fmtCorto(lleno)}. Elegí otro horario.`);
+      const fRef=f0;
       const oc=ocupantes(i.disciplina,fRef,s.horario).filter(o=>o.al.id!==id);
       // Un turno fijo se ocupa TODAS las semanas, así que lo único que lo puede
       // llenar de verdad son los otros turnos fijos (incluidas las que ese día
@@ -1921,8 +1938,6 @@ async function guardarAlumno(){
       // clases sueltas— ocupan sólo esa fecha, así que no pueden impedir una
       // asignación permanente: se avisa, pero no se bloquea.
       const fijos=oc.filter(o=>o.tipo==='fijo'||o.tipo==='movido-origen');
-      const disc=i.disciplina==='pilates'?'Pilates':'Indoor';
-      if(fijos.length>=cupo) return errorForm(`${disc} ${s.dia} ${s.horario} ya está completo (${cupo}/${cupo}). Elegí otro horario.`);
       if(oc.length>=cupo) avisos.push(`${s.dia} ${s.horario}: esa fecha hay ${oc.length-fijos.length} por única vez, quedan ${oc.length+1} en la clase`);
     }
     const consentFirmado=document.getElementById('f_consent').checked;
