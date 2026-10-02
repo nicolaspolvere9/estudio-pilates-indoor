@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Estudio — Gestión</title>
-<meta name="app-version" content="2026-10-01.1">
+<meta name="app-version" content="2026-10-02.1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -2236,16 +2236,26 @@ function reanclarCiclo(c,fecha){
   const arranca=conCicloEmpezado?fecha:addDays(c.hasta,1);
   if(conCicloEmpezado) c.hasta=addDays(fecha,-1);
   const hasta=finDeCiclo(arranca,al);
-  const vence=conCicloEmpezado?vencimientoDeCiclo(arranca,hasta,al):c.vence;
+  // Antes, si pagaba justo el primer día del ciclo (o antes), al ciclo
+  // siguiente se le copiaba la fecha de pago del que acababa de pagar: quedaba
+  // "a pagar hoy" otra vez y parecía que el pago no se había registrado.
+  // Ahora vence cuando se le terminan las clases que acaba de pagar.
+  const vence=conCicloEmpezado?vencimientoDeCiclo(arranca,hasta,al):primeraClaseDesde(arranca,al);
 
-  const sig=state.cargos.filter(x=>x.alumnoId===al.id&&!x.pagado&&x.tipo!=='suelta')
+  let sig=state.cargos.filter(x=>x.alumnoId===al.id&&!x.pagado&&x.tipo!=='suelta')
     .sort((a,b)=>a.desde.localeCompare(b.desde))[0];
   if(sig){ sig.desde=arranca; sig.hasta=hasta; sig.vence=vence; }
   else{
     const pr=precioDe(al);
-    state.cargos.push({id:uid(),alumnoId:al.id,tipo:'ciclo',desde:arranca,hasta,vence,
-      monto:pr.monto,detalle:pr.detalle,reparto:repartoDe(al),pagado:false,venceV2:true});
+    sig={id:uid(),alumnoId:al.id,tipo:'ciclo',desde:arranca,hasta,vence,
+      monto:pr.monto,detalle:pr.detalle,reparto:repartoDe(al),pagado:false,venceV2:true};
+    state.cargos.push(sig);
   }
+  // Cualquier otro ciclo impago que arranque antes de que termine el nuevo
+  // quedó reemplazado por el recuento: si se dejaba, aparecía como un ciclo
+  // duplicado/superpuesto (deuda fantasma).
+  const sobran=state.cargos.filter(x=>x.alumnoId===al.id&&!x.pagado&&x.tipo!=='suelta'&&x!==sig&&x.desde<=hasta);
+  if(sobran.length) state.cargos=state.cargos.filter(x=>!sobran.includes(x));
 }
 /* Corrige a mano cuándo tiene que pagar un ciclo pendiente. Hace falta porque
    el vencimiento se calcula contando las clases del ciclo desde que la alumna
